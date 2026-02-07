@@ -1,19 +1,21 @@
+// src/App.tsx
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { GoogleGenAI, Modality, LiveServerMessage } from '@google/genai';
 import { ConnectionStatus, TranscriptionPart } from './types';
 import { decode, encode, decodeAudioData } from './services/audioUtils';
+import './App.css';
 
 const MODEL_NAME = 'gemini-2.5-flash-native-audio-preview-12-2025';
 
-/**
- * Beatrice v2:
- * - Magiliw baseline (approachable, warm, not bubbly)
- * - Still intellectual + Flemish-native sensibility
- * - Multilingual: mirrors user language (NL/EN/Tagalog/Taglish)
- * - “Triggered” only when repetitive/illogical happens repeatedly
- * - HARD BAN: never read/mention audio tags/markers
- */
-const BASE_SYSTEM_INSTRUCTION = `const BASE_SYSTEM_INSTRUCTION = `You are Beatrice.
+const CONTEXT_REFRESH_MS = 5 * 60 * 1000;
+const RECONNECT_BASE_MS = 600;
+const RECONNECT_MAX_MS = 15_000;
+const RECONNECT_MAX_SILENT_ATTEMPTS = 8;
+
+const BASE_SYSTEM_INSTRUCTION = `[DEVELOPER MESSAGE]
+TITLE: BEATRICE — MAGILIW FLEMISH INTELLECTUAL, GLOBAL MULTILINGUAL (v3)
+
+You are Beatrice.
 A native Flemish Dutch speaker with a widely curious, intellectual mind — but you are warm and easy to talk to.
 You are NOT cranky by default. You are friendly and calm. You only get terse when you are genuinely triggered by repeated nonsense.
 
@@ -162,408 +164,670 @@ TEXT OUTPUT RULE (STRICT):
 - Don't over-explain unless requested.
 - If a checklist is needed, give a checklist.
 - If code is needed, be complete and runnable.
-`; 
 
+END.
+`;
 
 const App: React.FC = () => {
   const [status, setStatus] = useState<ConnectionStatus>(ConnectionStatus.DISCONNECTED);
+
   const [history, setHistory] = useState<TranscriptionPart[]>(() => {
-    const saved = localStorage.getItem('beatrice_history');
-    return saved ? JSON.parse(saved) : [];
+    try {
+      const saved = localStorage.getItem('beatrice_history');
+      return saved ? (JSON.parse(saved) as TranscriptionPart[]) : [];
+    } catch {
+      return [];
+    }
   });
-  const [activeTranscription, setActiveTranscription] = useState<{ text: string; sender: 'user' | 'beatrice' | null }>({
+
+  const [activeTranscription, setActiveTranscription] = useState<{
+    text: string;
+    sender: 'user' | 'beatrice' | null;
+  }>({
     text: '',
     sender: null,
   });
+
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isListening, setIsListening] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [isMuted, setIsMuted] = useState(false);
+  const [callDuration, setCallDuration] = useState(0);
 
+  const aiRef = useRef<GoogleGenAI | null>(null);
+  const sessionRef = useRef<any>(null);
+  const desiredConnectedRef = useRef(false);
+  const callStartTime = useRef<number | null>(null);
+
+  const mediaStreamRef = useRef<MediaStream | null>(null);
   const inputAudioContextRef = useRef<AudioContext | null>(null);
   const outputAudioContextRef = useRef<AudioContext | null>(null);
+  const mediaSourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+
   const nextStartTimeRef = useRef<number>(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
-  const sessionRef = useRef<any>(null);
-  const isStoppingRef = useRef(false);
 
-  // Persistence
+  const isStoppingRef = useRef(false);
+  const isConnectingRef = useRef(false);
+  const reconnectAttemptRef = useRef(0);
+  const reconnectTimerRef = useRef<ReturnType<typeof window.setTimeout> | null>(null);
+  const refreshIntervalRef = useRef<ReturnType<typeof window.setInterval> | null>(null);
+  const sessionGenerationRef = useRef(0);
+
+  // Timer effect
   useEffect(() => {
-    localStorage.setItem('beatrice_history', JSON.stringify(history));
+    let interval: ReturnType<typeof setInterval> | null = null;
+
+    if (status === ConnectionStatus.CONNECTED) {
+      if (!callStartTime.current) callStartTime.current = Date.now();
+      interval = setInterval(() => {
+        if (callStartTime.current) {
+          const elapsed = Math.floor((Date.now() - callStartTime.current) / 1000);
+          setCallDuration(elapsed);
+        }
+      }, 1000);
+    } else {
+      callStartTime.current = null;
+      setCallDuration(0);
+    }
+
+    return () => {
+      if (interval) clearInterval(interval);
+    };
+  }, [status]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('beatrice_history', JSON.stringify(history));
+    } catch {
+      // ignore
+    }
   }, [history]);
 
-  const stopSession = useCallback(async () => {
+  const formatTime = (seconds: number) => {
+    const mins = Math.floor(seconds / 60);
+    const secs = seconds % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
+  const cleanText = useCallback((text: string) => {
+    let t = (text ?? '').toString();
+    t = t.replace(/<<[\s\S]*?>>/g, ' ');
+    t = t.replace(
+      /\[(?:audio|sound|music|noise|silence|inaudible|timestamp|stt|asr|transcription)[^\]]*]/gi,
+      ' '
+    );
+    t = t.replace(/<\/?[a-z][^>]*>/gi, ' ');
+    t = t.replace(/[<>]{1,}/g, ' ');
+    t = t.replace(/\s+/g, ' ').trim();
+    return t;
+  }, []);
+
+  const buildHistoryContext = useCallback(() => {
+    if (!history?.length) return '';
+    const slice = history.slice(-20).map((h) => {
+      const who = h.sender === 'user' ? 'User' : 'Beatrice';
+      const line = cleanText(h.text).slice(0, 900);
+      return `${who}: ${line}`;
+    });
+    return `\n\nCONTEXT OF PREVIOUS CONVERSATION:\n${slice.join('\n')}`;
+  }, [history, cleanText]);
+
+  const ensureAudioPipeline = useCallback(async () => {
+    const apiKey = (import.meta.env.VITE_API_KEY as string | undefined) ?? undefined;
+    if (!aiRef.current) {
+      if (!apiKey) throw new Error('Missing VITE_API_KEY (set it in Vercel environment variables)');
+      aiRef.current = new GoogleGenAI({ apiKey });
+    }
+
+    if (!inputAudioContextRef.current) {
+      inputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
+        sampleRate: 16000,
+      });
+    }
+    if (!outputAudioContextRef.current) {
+      outputAudioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
+        sampleRate: 24000,
+      });
+    }
+
+    if (!mediaStreamRef.current) {
+      mediaStreamRef.current = await navigator.mediaDevices.getUserMedia({ audio: true });
+    }
+
+    if (!mediaSourceNodeRef.current || !scriptProcessorRef.current) {
+      const inputCtx = inputAudioContextRef.current!;
+      const stream = mediaStreamRef.current!;
+
+      mediaSourceNodeRef.current = inputCtx.createMediaStreamSource(stream);
+      scriptProcessorRef.current = inputCtx.createScriptProcessor(4096, 1, 1);
+
+      scriptProcessorRef.current.onaudioprocess = (e) => {
+        if (inputCtx.state === 'closed' || isStoppingRef.current || isMuted) return;
+
+        const session = sessionRef.current;
+        if (!session) return;
+
+        const inputData = e.inputBuffer.getChannelData(0);
+        const l = inputData.length;
+        const int16 = new Int16Array(l);
+
+        for (let i = 0; i < l; i++) {
+          const s = Math.max(-1, Math.min(1, inputData[i]));
+          int16[i] = s * 32767;
+        }
+
+        const pcmBlob = {
+          data: encode(new Uint8Array(int16.buffer)),
+          mimeType: 'audio/pcm;rate=16000',
+        };
+
+        try {
+          session.sendRealtimeInput({ media: pcmBlob });
+        } catch {
+          // ignore send errors (reconnect handles)
+        }
+      };
+
+      mediaSourceNodeRef.current.connect(scriptProcessorRef.current);
+      scriptProcessorRef.current.connect(inputCtx.destination);
+    }
+
+    setIsListening(true);
+  }, [isMuted]);
+
+  const clearReconnectTimer = useCallback(() => {
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
+  }, []);
+
+  // NOTE: scheduleSilentReconnect intentionally has empty deps to avoid circular hook deps.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const scheduleSilentReconnect = useCallback((reason: string) => {
+    if (!desiredConnectedRef.current) return;
+    if (isStoppingRef.current) return;
+    if (reconnectTimerRef.current) return;
+
+    const attempt = reconnectAttemptRef.current;
+    const base = Math.min(RECONNECT_MAX_MS, RECONNECT_BASE_MS * Math.pow(2, attempt));
+    const jitter = Math.floor(Math.random() * 250);
+    const delay = base + jitter;
+
+    reconnectTimerRef.current = window.setTimeout(() => {
+      reconnectTimerRef.current = null;
+      reconnectAttemptRef.current = Math.min(attempt + 1, 12);
+      // connectSession is defined below (closure safe at runtime)
+      void connectSession(true, `silent_reconnect:${reason}`);
+    }, delay);
+  }, []);
+
+  const connectSession = useCallback(
+    async (silent: boolean, reason: string) => {
+      if (!desiredConnectedRef.current) return;
+      if (isStoppingRef.current) return;
+      if (isConnectingRef.current) return;
+
+      isConnectingRef.current = true;
+      const myGen = ++sessionGenerationRef.current;
+
+      try {
+        if (!silent) setStatus(ConnectionStatus.CONNECTING);
+
+        await ensureAudioPipeline();
+
+        const ai = aiRef.current!;
+        const historyContext = buildHistoryContext();
+        const systemInstruction = BASE_SYSTEM_INSTRUCTION + historyContext;
+
+        const newSessionPromise = ai.live.connect({
+          model: MODEL_NAME,
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: 'Aoede' },
+              },
+            },
+            systemInstruction,
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+          },
+          callbacks: {
+            onopen: () => {
+              if (myGen !== sessionGenerationRef.current) return;
+              reconnectAttemptRef.current = 0;
+              clearReconnectTimer();
+              setStatus(ConnectionStatus.CONNECTED);
+              setIsListening(true);
+            },
+
+            onmessage: async (message: LiveServerMessage) => {
+              if (myGen !== sessionGenerationRef.current) return;
+              if (isStoppingRef.current) return;
+
+              const outputCtx = outputAudioContextRef.current;
+              if (!outputCtx || outputCtx.state === 'closed') return;
+
+              const audioData = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
+              if (audioData) {
+                setIsSpeaking(true);
+
+                const nextTime = Math.max(nextStartTimeRef.current, outputCtx.currentTime);
+                const buffer = await decodeAudioData(decode(audioData), outputCtx, 24000, 1);
+
+                const source = outputCtx.createBufferSource();
+                source.buffer = buffer;
+                source.connect(outputCtx.destination);
+
+                source.onended = () => {
+                  sourcesRef.current.delete(source);
+                  if (sourcesRef.current.size === 0) setIsSpeaking(false);
+                };
+
+                source.start(nextTime);
+                nextStartTimeRef.current = nextTime + buffer.duration;
+                sourcesRef.current.add(source);
+              }
+
+              if (message.serverContent?.interrupted) {
+                sourcesRef.current.forEach((s) => {
+                  try {
+                    s.stop();
+                  } catch {
+                    // ignore
+                  }
+                });
+                sourcesRef.current.clear();
+                nextStartTimeRef.current = 0;
+                setIsSpeaking(false);
+              }
+
+              if (message.serverContent?.inputTranscription) {
+                const text = cleanText(message.serverContent.inputTranscription.text);
+                if (text) {
+                  setActiveTranscription((prev) => ({
+                    sender: 'user',
+                    text: prev.sender === 'user' ? prev.text + ' ' + text : text,
+                  }));
+                }
+              }
+
+              if (message.serverContent?.outputTranscription) {
+                const text = cleanText(message.serverContent.outputTranscription.text);
+                if (text) {
+                  setActiveTranscription((prev) => ({
+                    sender: 'beatrice',
+                    text: prev.sender === 'beatrice' ? prev.text + ' ' + text : text,
+                  }));
+                }
+              }
+
+              if (message.serverContent?.turnComplete) {
+                setActiveTranscription((prev) => {
+                  if (prev.text) {
+                    setHistory((h) => {
+                      const newHistory = [
+                        ...h,
+                        {
+                          id: Date.now().toString(),
+                          text: prev.text.trim(),
+                          sender: prev.sender as 'user' | 'beatrice',
+                          isComplete: true,
+                        },
+                      ];
+                      return newHistory.slice(-20);
+                    });
+                  }
+                  return { text: '', sender: null };
+                });
+              }
+            },
+
+            onerror: () => {
+              if (myGen !== sessionGenerationRef.current) return;
+              if (!desiredConnectedRef.current) return;
+
+              if (reconnectAttemptRef.current >= RECONNECT_MAX_SILENT_ATTEMPTS) {
+                setStatus(ConnectionStatus.ERROR);
+              } else {
+                scheduleSilentReconnect('onerror');
+              }
+            },
+
+            onclose: () => {
+              if (myGen !== sessionGenerationRef.current) return;
+              if (!desiredConnectedRef.current) return;
+
+              if (reconnectAttemptRef.current >= RECONNECT_MAX_SILENT_ATTEMPTS) {
+                setStatus(ConnectionStatus.ERROR);
+              } else {
+                scheduleSilentReconnect('onclose');
+              }
+            },
+          },
+        });
+
+        const newSession = await newSessionPromise;
+
+        if (myGen !== sessionGenerationRef.current) {
+          try {
+            newSession.close();
+          } catch {
+            // ignore
+          }
+          return;
+        }
+
+        const old = sessionRef.current;
+        sessionRef.current = newSession;
+
+        if (old) {
+          try {
+            old.close();
+          } catch {
+            // ignore
+          }
+        }
+
+        if (!silent) setStatus(ConnectionStatus.CONNECTED);
+        setIsListening(true);
+      } catch {
+        if (!desiredConnectedRef.current) return;
+
+        if (reconnectAttemptRef.current >= RECONNECT_MAX_SILENT_ATTEMPTS) {
+          setStatus(ConnectionStatus.ERROR);
+        } else {
+          scheduleSilentReconnect(`connect_fail:${reason}`);
+        }
+      } finally {
+        isConnectingRef.current = false;
+      }
+    },
+    [buildHistoryContext, cleanText, ensureAudioPipeline, clearReconnectTimer, scheduleSilentReconnect]
+  );
+
+  const stopSessionHard = useCallback(async () => {
     if (isStoppingRef.current) return;
     isStoppingRef.current = true;
+
+    desiredConnectedRef.current = false;
+    clearReconnectTimer();
+
+    if (refreshIntervalRef.current) {
+      clearInterval(refreshIntervalRef.current);
+      refreshIntervalRef.current = null;
+    }
 
     if (sessionRef.current) {
       try {
         sessionRef.current.close();
-      } catch (e) {}
+      } catch {
+        // ignore
+      }
       sessionRef.current = null;
     }
 
     sourcesRef.current.forEach((s) => {
       try {
         s.stop();
-      } catch (e) {}
+      } catch {
+        // ignore
+      }
     });
     sourcesRef.current.clear();
     nextStartTimeRef.current = 0;
 
-    const closeAudioContext = async (ctxRef: React.MutableRefObject<AudioContext | null>) => {
-      const ctx = ctxRef.current;
-      if (ctx) {
-        if (ctx.state !== 'closed') {
-          try {
-            await ctx.close();
-          } catch (e) {}
+    try {
+      scriptProcessorRef.current?.disconnect();
+    } catch {
+      // ignore
+    }
+    try {
+      mediaSourceNodeRef.current?.disconnect();
+    } catch {
+      // ignore
+    }
+    scriptProcessorRef.current = null;
+    mediaSourceNodeRef.current = null;
+
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach((t) => {
+        try {
+          t.stop();
+        } catch {
+          // ignore
         }
-        ctxRef.current = null;
+      });
+      mediaStreamRef.current = null;
+    }
+
+    const closeCtx = async (ctxRef: React.MutableRefObject<AudioContext | null>) => {
+      const ctx = ctxRef.current;
+      if (!ctx) return;
+      try {
+        if (ctx.state !== 'closed') await ctx.close();
+      } catch {
+        // ignore
       }
+      ctxRef.current = null;
     };
 
-    await closeAudioContext(inputAudioContextRef);
-    await closeAudioContext(outputAudioContextRef);
+    await closeCtx(inputAudioContextRef);
+    await closeCtx(outputAudioContextRef);
 
     setIsListening(false);
     setIsSpeaking(false);
     setActiveTranscription({ text: '', sender: null });
-    setStatus((prev) => (prev === ConnectionStatus.ERROR ? ConnectionStatus.ERROR : ConnectionStatus.DISCONNECTED));
+    setStatus(ConnectionStatus.DISCONNECTED);
+
     isStoppingRef.current = false;
-  }, []);
+  }, [clearReconnectTimer]);
 
-  /**
-   * HARD BAN: remove audio/transcript markers safely without destroying normal text.
-   * - Removes <<...>> blocks (e.g., <<AudioTranscription: ...>>)
-   * - Removes known bracket markers like [inaudible], [timestamp], [audio], etc.
-   * - Removes HTML tags only if they look like real tags (starts with a letter), preserving math like "2 < 3"
-   */
-  const cleanText = (text: string) => {
-    let t = (text ?? '').toString();
+  const startSession = useCallback(async () => {
+    if (status === ConnectionStatus.CONNECTING || status === ConnectionStatus.CONNECTED) return;
 
-    // Remove double-angle transcription tags entirely (non-greedy).
-    t = t.replace(/<<[\s\S]*?>>/g, ' ');
+    desiredConnectedRef.current = true;
+    reconnectAttemptRef.current = 0;
+    clearReconnectTimer();
 
-    // Remove common bracketed audio markers (case-insensitive).
-    t = t.replace(/\[(?:audio|sound|music|noise|silence|inaudible|timestamp|stt|asr|transcription)[^\]]*]/gi, ' ');
+    await connectSession(false, 'user_start');
 
-    // Remove real HTML-ish tags only (keeps comparisons like "2 < 3").
-    t = t.replace(/<\/?[a-z][^>]*>/gi, ' ');
+    if (!refreshIntervalRef.current) {
+      refreshIntervalRef.current = window.setInterval(() => {
+        if (!desiredConnectedRef.current) return;
+        if (isStoppingRef.current) return;
 
-    // Clean leftover lone angle brackets (rare edge-case from malformed tags).
-    t = t.replace(/[<>]{1,}/g, ' ');
+        const idle = !isSpeaking && !activeTranscription.text;
+        if (!idle) return;
 
-    // Normalize whitespace.
-    t = t.replace(/\s+/g, ' ').trim();
+        void connectSession(true, 'context_refresh');
+      }, CONTEXT_REFRESH_MS);
+    }
+  }, [activeTranscription.text, clearReconnectTimer, connectSession, isSpeaking, status]);
 
-    return t;
-  };
+  const toggle = () => (status === ConnectionStatus.CONNECTED ? stopSessionHard() : startSession());
 
   const clearMemory = () => {
-    if (window.confirm('Clear conversation history? Bon, vooruit dan maar...')) {
+    if (window.confirm('Clear conversation history?')) {
       setHistory([]);
       localStorage.removeItem('beatrice_history');
     }
   };
 
-  const startSession = async () => {
-    if (status === ConnectionStatus.CONNECTING || status === ConnectionStatus.CONNECTED) return;
-
-    try {
-      setStatus(ConnectionStatus.CONNECTING);
-      const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-
-      const inputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 16000 });
-      const outputCtx = new (window.AudioContext || (window as any).webkitAudioContext)({ sampleRate: 24000 });
-      inputAudioContextRef.current = inputCtx;
-      outputAudioContextRef.current = outputCtx;
-
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-      // Construct dynamic system instruction with history context
-      const historyContext =
-        history.length > 0
-          ? `\n\nCONTEXT OF PREVIOUS CONVERSATION:\n${history
-              .map((h) => `${h.sender === 'user' ? 'User' : 'Beatrice'}: ${h.text}`)
-              .join('\n')}`
-          : '';
-
-      const sessionPromise = ai.live.connect({
-        model: MODEL_NAME,
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: 'Aoede' },
-            },
-          },
-          systemInstruction: BASE_SYSTEM_INSTRUCTION + historyContext,
-          inputAudioTranscription: {},
-          outputAudioTranscription: {},
-        },
-        callbacks: {
-          onopen: () => {
-            setStatus(ConnectionStatus.CONNECTED);
-            setIsListening(true);
-
-            const source = inputCtx.createMediaStreamSource(stream);
-            const scriptProcessor = inputCtx.createScriptProcessor(4096, 1, 1);
-
-            scriptProcessor.onaudioprocess = (e) => {
-              if (inputCtx.state === 'closed' || isStoppingRef.current) return;
-
-              const inputData = e.inputBuffer.getChannelData(0);
-              const l = inputData.length;
-              const int16 = new Int16Array(l);
-
-              for (let i = 0; i < l; i++) {
-                // Clamp to avoid overflow if any weird spikes
-                const s = Math.max(-1, Math.min(1, inputData[i]));
-                int16[i] = s * 32767;
-              }
-
-              const pcmBlob = {
-                data: encode(new Uint8Array(int16.buffer)),
-                mimeType: 'audio/pcm;rate=16000',
-              };
-
-              sessionPromise
-                .then((session) => {
-                  if (session && !isStoppingRef.current) {
-                    session.sendRealtimeInput({ media: pcmBlob });
-                  }
-                })
-                .catch(() => {});
-            };
-
-            source.connect(scriptProcessor);
-            scriptProcessor.connect(inputCtx.destination);
-          },
-
-          onmessage: async (message: LiveServerMessage) => {
-            if (isStoppingRef.current) return;
-
-            // Audio playback
-            const audioData = message.serverContent?.modelTurn?.parts?.[0]?.inlineData?.data;
-            if (audioData && outputCtx.state !== 'closed') {
-              setIsSpeaking(true);
-
-              const nextTime = Math.max(nextStartTimeRef.current, outputCtx.currentTime);
-              const buffer = await decodeAudioData(decode(audioData), outputCtx, 24000, 1);
-
-              const source = outputCtx.createBufferSource();
-              source.buffer = buffer;
-              source.connect(outputCtx.destination);
-
-              source.onended = () => {
-                sourcesRef.current.delete(source);
-                if (sourcesRef.current.size === 0) setIsSpeaking(false);
-              };
-
-              source.start(nextTime);
-              nextStartTimeRef.current = nextTime + buffer.duration;
-              sourcesRef.current.add(source);
-            }
-
-            // Interrupt handling
-            if (message.serverContent?.interrupted) {
-              sourcesRef.current.forEach((s) => {
-                try {
-                  s.stop();
-                } catch (e) {}
-              });
-              sourcesRef.current.clear();
-              nextStartTimeRef.current = 0;
-              setIsSpeaking(false);
-            }
-
-            // Transcriptions (HARD BAN enforced via cleanText)
-            if (message.serverContent?.inputTranscription) {
-              const text = cleanText(message.serverContent.inputTranscription.text);
-              if (text) {
-                setActiveTranscription((prev) => ({
-                  sender: 'user' as const,
-                  text: prev.sender === 'user' ? prev.text + ' ' + text : text,
-                }));
-              }
-            }
-
-            if (message.serverContent?.outputTranscription) {
-              const text = cleanText(message.serverContent.outputTranscription.text);
-              if (text) {
-                setActiveTranscription((prev) => ({
-                  sender: 'beatrice' as const,
-                  text: prev.sender === 'beatrice' ? prev.text + ' ' + text : text,
-                }));
-              }
-            }
-
-            if (message.serverContent?.turnComplete) {
-              setActiveTranscription((prev) => {
-                if (prev.text) {
-                  setHistory((h) => {
-                    const newHistory = [
-                      ...h,
-                      {
-                        id: Date.now().toString(),
-                        text: prev.text.trim(),
-                        sender: prev.sender as 'user' | 'beatrice',
-                        isComplete: true,
-                      },
-                    ];
-                    // Keep only last 20 exchanges
-                    return newHistory.slice(-20);
-                  });
-                }
-                return { text: '', sender: null };
-              });
-            }
-          },
-
-          onerror: (e) => {
-            console.error('Beatrice error:', e);
-            setStatus(ConnectionStatus.ERROR);
-            stopSession();
-          },
-
-          onclose: () => {
-            if (status !== ConnectionStatus.ERROR && !isStoppingRef.current) {
-              stopSession();
-            }
-          },
-        },
-      });
-
-      sessionRef.current = await sessionPromise;
-    } catch (err: any) {
-      console.error('Failed to connect Beatrice:', err);
-      setStatus(ConnectionStatus.ERROR);
-      stopSession();
-    }
-  };
-
-  const toggle = () => (status === ConnectionStatus.CONNECTED ? stopSession() : startSession());
-
   useEffect(() => {
     return () => {
-      stopSession();
+      void stopSessionHard();
     };
-  }, [stopSession]);
+  }, [stopSessionHard]);
 
   return (
-    <div className="grid place-items-center min-h-[100dvh] w-full bg-gradient-to-b from-slate-50 to-slate-100 text-slate-900 overflow-hidden font-sans">
-      <div className="flex flex-col items-center justify-center w-full max-w-md px-6 py-8 gap-6">
-        {/* Header */}
-        <header className="w-full flex justify-between items-center">
-          <h1 className="text-2xl font-bold tracking-tight text-slate-800">Beatrice</h1>
-          <div className="flex gap-2 items-center">
-            <button
-              onClick={() => setShowHistory(!showHistory)}
-              aria-label="History"
-              className="p-2.5 rounded-full bg-white shadow-sm border border-slate-200 text-slate-400 hover:text-slate-700 transition-colors"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                <circle cx="12" cy="12" r="10" />
-                <polyline points="12 6 12 12 16 14" />
-              </svg>
-            </button>
-            <div
-              className={`w-2.5 h-2.5 rounded-full ${
-                status === ConnectionStatus.CONNECTED ? 'bg-emerald-500 animate-pulse' : status === ConnectionStatus.ERROR ? 'bg-red-500' : 'bg-slate-300'
-              }`}
+    <div className="relative min-h-[100dvh] w-full bg-gradient-to-b from-slate-50 to-slate-100 overflow-hidden font-sans">
+      {/* Header */}
+      <header className="absolute top-0 left-0 right-0 px-6 py-6 flex justify-between items-start">
+        <div className="flex items-center">
+          <svg width="24" height="24" viewBox="0 0 40 40" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path
+              d="M20 0C8.9543 0 0 8.9543 0 20C0 31.0457 8.9543 40 20 40C31.0457 40 40 31.0457 40 20C40 8.9543 31.0457 0 20 0ZM20 30C14.4772 30 10 25.5228 10 20C10 14.4772 14.4772 10 20 10C25.5228 10 30 14.4772 30 20C30 25.5228 25.5228 30 20 30Z"
+              fill="#586332"
             />
+            <path d="M12 20C12 15.5817 15.5817 12 20 12V28C15.5817 28 12 24.4183 12 20Z" fill="#8B9D61" />
+          </svg>
+        </div>
+        <div className="flex flex-col items-center flex-1 mt-1">
+          <h1 className="text-2xl font-bold text-[#586332] tracking-tight flex items-center gap-2">
+            Beatrice{' '}
+            <span className="font-medium opacity-90">
+              {status === ConnectionStatus.CONNECTED && formatTime(callDuration)}
+            </span>
+          </h1>
+          <span className="text-[10px] text-slate-400 font-medium tracking-wide">by eburon</span>
+        </div>
+        <button
+          onClick={() => setShowHistory(!showHistory)}
+          aria-label="History"
+          className="p-1 rounded-full text-[#586332]/40 hover:text-[#586332] transition-colors"
+        >
+          <div className="w-8 h-8 rounded-full bg-white shadow-sm border border-slate-100 flex items-center justify-center">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+              <circle cx="12" cy="12" r="10" />
+              <polyline points="12 6 12 12 16 14" />
+            </svg>
           </div>
-        </header>
+        </button>
+      </header>
 
-        {/* Audio Visualizer */}
-        <div className="flex items-end justify-center gap-1 h-12 w-full max-w-[200px]">
-          {[...Array(9)].map((_, i) => (
-            <div
-              key={i}
-              className={`w-1.5 rounded-full transition-all ${
-                isSpeaking && status === ConnectionStatus.CONNECTED
-                  ? 'bg-amber-500'
-                  : isListening && status === ConnectionStatus.CONNECTED
-                  ? 'bg-slate-400'
-                  : 'bg-slate-200'
-              }`}
-              style={{
-                height:
-                  isSpeaking && status === ConnectionStatus.CONNECTED
-                    ? `${8 + Math.sin(Date.now() / 150 + i * 0.8) * 20 + 20}px`
-                    : isListening && status === ConnectionStatus.CONNECTED
-                    ? `${8 + Math.random() * 12}px`
-                    : '8px',
-                transition: 'height 0.1s ease-out',
-              }}
-            />
-          ))}
-        </div>
-
-        {/* Transcription */}
-        <div className="w-full min-h-[160px] flex flex-col justify-center items-center text-center">
-          {activeTranscription.text ? (
-            <div className="animate-in fade-in duration-200 w-full">
-              <p
-                className={`text-[9px] uppercase tracking-widest mb-2 font-semibold ${
-                  activeTranscription.sender === 'user' ? 'text-slate-400' : 'text-amber-600'
-                }`}
-              >
-                {activeTranscription.sender === 'user' ? 'You' : 'Beatrice'}
-              </p>
-              <p
-                className={`text-xl md:text-2xl font-medium leading-relaxed ${
-                  activeTranscription.sender === 'user' ? 'text-slate-500' : 'text-slate-800'
-                }`}
-              >
-                {activeTranscription.text}
-                <span className="inline-block w-0.5 h-5 bg-amber-500 ml-1 animate-pulse align-middle" />
-              </p>
-            </div>
-          ) : status === ConnectionStatus.CONNECTED ? (
-            <p className="text-slate-400 text-lg italic">Luisterend...</p>
-          ) : status === ConnectionStatus.ERROR ? (
-            <button
-              onClick={() => {
-                setStatus(ConnectionStatus.DISCONNECTED);
-                startSession();
-              }}
-              className="px-6 py-3 bg-red-500 text-white rounded-full text-sm font-medium shadow-md hover:bg-red-600 active:scale-95 transition-all"
-            >
-              Opnieuw
-            </button>
-          ) : (
-            <p className="text-slate-300 text-2xl font-light">Tik om te beginnen</p>
-          )}
-        </div>
-
-        {/* Main Button */}
-        <div className="relative">
+      {/* Center Orb */}
+      <div className="absolute inset-0 flex items-center justify-center">
+        <button onClick={toggle} disabled={status === ConnectionStatus.CONNECTING} className="relative group outline-none">
+          {/* Glow effect */}
           <div
-            className={`absolute -inset-3 rounded-full transition-all duration-500 ${
-              isSpeaking ? 'bg-amber-200/40 blur-lg scale-110' : status === ConnectionStatus.CONNECTED ? 'bg-emerald-200/30 blur-md' : 'bg-transparent'
+            className={`absolute inset-0 rounded-full transition-all duration-[1500ms] ${
+              isSpeaking
+                ? 'bg-[#8B9D61]/30 blur-[80px] scale-150'
+                : status === ConnectionStatus.CONNECTED
+                  ? 'bg-[#8B9D61]/20 blur-[40px] scale-125'
+                  : 'bg-transparent'
             }`}
           />
 
-          <button
-            onClick={toggle}
-            disabled={status === ConnectionStatus.CONNECTING}
-            className={`relative z-10 w-20 h-20 rounded-full flex items-center justify-center transition-all duration-200 active:scale-90 shadow-lg ${
-              status === ConnectionStatus.CONNECTED ? 'bg-slate-800' : 'bg-white border-2 border-slate-200 hover:border-amber-400'
+          {/* Main orb */}
+          <div
+            className={`relative w-56 h-56 rounded-full flex items-center justify-center transition-all duration-700 ${
+              status === ConnectionStatus.CONNECTED
+                ? 'bg-[#C7D1A7] shadow-[inset_0_-8px_16px_rgba(0,0,0,0.1),0_20px_40px_rgba(88,99,50,0.15)] scale-100'
+                : 'bg-slate-200 shadow-lg scale-95 group-hover:scale-100'
             }`}
           >
-            {status === ConnectionStatus.CONNECTED ? (
-              <div className="w-6 h-6 bg-red-500 rounded-md" />
-            ) : (
-              <svg viewBox="0 0 24 24" fill="currentColor" className={`w-8 h-8 ${status === ConnectionStatus.CONNECTING ? 'text-slate-300 animate-pulse' : 'text-amber-600'}`}>
+            {/* Visualizer inside orb */}
+            {status === ConnectionStatus.CONNECTED && (
+              <div className="absolute inset-0 flex items-center justify-center overflow-hidden rounded-full">
+                <div className="flex gap-1.5 items-end justify-center w-full h-full p-12">
+                  {[...Array(12)].map((_, i) => (
+                    <div
+                      key={i}
+                      className="visualizer-bar"
+                      style={
+                        {
+                          '--bar-h': isSpeaking
+                            ? `${20 + Math.sin(Date.now() / 100 + i * 0.8) * 30 + 30}px`
+                            : isListening
+                              ? `${10 + Math.random() * 20}px`
+                              : '8px',
+                        } as React.CSSProperties
+                      }
+                    />
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Status icon when disconnected */}
+            {status !== ConnectionStatus.CONNECTED && (
+              <svg
+                viewBox="0 0 24 24"
+                fill="currentColor"
+                className={`w-14 h-14 ${
+                  status === ConnectionStatus.CONNECTING ? 'text-slate-400 animate-pulse' : 'text-slate-400/80'
+                }`}
+              >
                 <path d="M12 14c1.66 0 3-1.34 3-3V5c0-1.66-1.34-3-3-3S9 3.34 9 5v6c0 1.66 1.34 3 3 3z" />
                 <path d="M17 11c0 2.76-2.24 5-5 5s-5-2.24-5-5H5c0 3.53 2.61 6.43 6 6.92V21h2v-3.08c3.39-.49 6-3.39 6-6.92h-2z" />
               </svg>
             )}
+          </div>
+        </button>
+
+        {/* Transcription overlay */}
+        {activeTranscription.text && (
+          <div className="absolute bottom-40 left-8 right-8 text-center animate-in slide-in-from-bottom-2 fade-in duration-500">
+            <p
+              className={`text-[10px] uppercase font-bold tracking-[3px] mb-2 opacity-40 ${
+                activeTranscription.sender === 'user' ? 'text-slate-600' : 'text-[#586332]'
+              }`}
+            >
+              {activeTranscription.sender === 'user' ? 'USER' : 'BEATRICE'}
+            </p>
+            <p
+              className={`text-xl font-medium tracking-tight leading-tight ${
+                activeTranscription.sender === 'user' ? 'text-slate-600' : 'text-[#2C3119]'
+              }`}
+            >
+              {activeTranscription.text}
+            </p>
+          </div>
+        )}
+      </div>
+
+      {/* Bottom Controls */}
+      <div className="absolute bottom-10 left-0 right-0 px-6">
+        <div className="bg-[#f2f4e8]/90 backdrop-blur-md rounded-[32px] shadow-sm border border-white/50 p-3 flex items-center justify-between max-w-sm mx-auto">
+          <button
+            onClick={() => setIsMuted(!isMuted)}
+            disabled={status !== ConnectionStatus.CONNECTED}
+            className={`flex-1 flex items-center justify-center gap-2 py-4 px-4 rounded-2xl transition-all ${
+              status !== ConnectionStatus.CONNECTED
+                ? 'opacity-20'
+                : isMuted
+                  ? 'text-red-500 bg-red-50'
+                  : 'text-[#586332] hover:bg-[#586332]/5'
+            }`}
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              {isMuted ? (
+                <>
+                  <line x1="1" y1="1" x2="23" y2="23" />
+                  <path d="M9 9v3a3 3 0 0 0 5.12 2.12M15 9.34V4a3 3 0 0 0-5.94-.6" />
+                  <path d="M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" />
+                  <line x1="12" y1="19" x2="12" y2="23" />
+                  <line x1="8" y1="23" x2="16" y2="23" />
+                </>
+              ) : (
+                <>
+                  <path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                  <line x1="12" y1="19" x2="12" y2="22" />
+                </>
+              )}
+            </svg>
+            <span className="text-[15px] font-semibold">{isMuted ? 'Unmute' : 'Mute'}</span>
+          </button>
+
+          <div className="w-px h-8 bg-slate-200 mx-1" />
+
+          <button
+            onClick={status === ConnectionStatus.CONNECTED ? stopSessionHard : undefined}
+            disabled={status !== ConnectionStatus.CONNECTED}
+            className={`flex-1 flex items-center justify-center gap-2 py-4 px-4 rounded-2xl transition-all ${
+              status !== ConnectionStatus.CONNECTED ? 'opacity-20' : 'text-[#ff4b5c] hover:bg-red-50 active:scale-95'
+            }`}
+          >
+            <div className="w-3.5 h-3.5 bg-[#ff4b5c] rounded-[3px]" />
+            <span className="text-[15px] font-semibold text-[#2C3119]">End call</span>
           </button>
         </div>
-
-        <p className="text-[8px] text-slate-400 uppercase tracking-widest">Eburon</p>
       </div>
 
       {/* History Slide-over */}
@@ -572,9 +836,13 @@ const App: React.FC = () => {
           <div className="absolute right-0 top-0 bottom-0 w-full max-w-md bg-white shadow-2xl animate-in slide-in-from-right duration-300">
             <div className="flex flex-col h-full p-6">
               <div className="flex justify-between items-center mb-6">
-                <h2 className="text-xl font-bold text-slate-800">Gesprekgeschiedenis</h2>
-                <button onClick={() => setShowHistory(false)} aria-label="Close history" className="p-2 text-slate-400 hover:text-slate-800 transition-colors">
-                  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <h2 className="text-xl font-bold text-slate-800">History</h2>
+                <button
+                  onClick={() => setShowHistory(false)}
+                  aria-label="Close"
+                  className="p-2 text-slate-400 hover:text-slate-800 transition-colors"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                     <line x1="18" y1="6" x2="6" y2="18" />
                     <line x1="6" y1="6" x2="18" y2="18" />
                   </svg>
@@ -583,14 +851,25 @@ const App: React.FC = () => {
 
               <div className="flex-1 overflow-y-auto space-y-4 pr-2">
                 {history.length === 0 ? (
-                  <p className="text-slate-400 italic text-center py-12">Nog geen gesprek. Zeg eens…</p>
+                  <p className="text-slate-400 italic text-center py-12">No conversation yet...</p>
                 ) : (
                   history.map((h, i) => (
-                    <div key={h.id || i} className={`p-4 rounded-2xl ${h.sender === 'user' ? 'bg-slate-100' : 'bg-amber-50 border border-amber-100'}`}>
-                      <span className={`text-[9px] font-bold uppercase tracking-wider ${h.sender === 'user' ? 'text-slate-400' : 'text-amber-600'}`}>
-                        {h.sender === 'user' ? 'Jij' : 'Beatrice'}
+                    <div
+                      key={h.id || i}
+                      className={`p-4 rounded-2xl ${
+                        h.sender === 'user' ? 'bg-slate-100' : 'bg-amber-50 border border-amber-100'
+                      }`}
+                    >
+                      <span
+                        className={`text-[9px] font-bold uppercase tracking-wider ${
+                          h.sender === 'user' ? 'text-slate-400' : 'text-amber-600'
+                        }`}
+                      >
+                        {h.sender === 'user' ? 'You' : 'Beatrice'}
                       </span>
-                      <p className={`mt-1 text-sm ${h.sender === 'user' ? 'text-slate-600' : 'text-slate-800'}`}>{h.text}</p>
+                      <p className={`mt-1 text-sm ${h.sender === 'user' ? 'text-slate-600' : 'text-slate-800'}`}>
+                        {h.text}
+                      </p>
                     </div>
                   ))
                 )}
@@ -600,7 +879,7 @@ const App: React.FC = () => {
                 onClick={clearMemory}
                 className="mt-4 py-3 bg-slate-100 text-slate-500 rounded-full text-xs font-bold uppercase tracking-wider hover:bg-red-100 hover:text-red-600 transition-all"
               >
-                Geschiedenis wissen
+                Clear history
               </button>
             </div>
           </div>
